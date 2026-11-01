@@ -116,6 +116,13 @@ def generate_plantuml_code(data):
     for entity_type in ["processes", "data_stores", "external_entities"]:
         if entity_type in data:
             for entity in data[entity_type]:
+                # Only spaces are folded, so two names that differ
+                # just in spaces versus underscores, My Process and
+                # My_Process, collapse to one alias and the second
+                # definition replaces the first in the diagram. A flow
+                # naming something never defined is not checked either:
+                # PlantUML draws it as a new box, so a typo in a source
+                # or destination becomes a phantom element.
                 entity_name = entity["name"].replace(" ", "_") # Replace spaces in names
                 if entity_type == "processes":
                     plantuml_code += f"component [{entity['name']}] as {entity_name}\n"
@@ -150,6 +157,10 @@ def generate_diagram(plantuml_code, output_file, plantuml_path):
         with open("temp.plantuml", "w") as f:
             f.write(plantuml_code)
 
+        # The staging file name is fixed in the working directory, so
+        # parallel runs overwrite each other. A bare output file name
+        # also gives an empty directory here, and PlantUML is then
+        # called with an empty -o value.
         # Construct the command to run PlantUML
         command = [plantuml_path, "-tpng", "temp.plantuml", "-o", os.path.dirname(output_file)]
 
@@ -315,6 +326,9 @@ def main():
     if args.file_type == 'yaml' or args.file_type == 'json':
         data = load_data(args.input_file, args.file_type)
     elif args.file_type == 'code':
+        # Code mode never opens the file it is given. analyze_code
+        # returns the same sample diagram data for every input, so the
+        # diagram from this mode describes the sample, not the target.
         data = analyze_code(args.input_file)
     elif args.file_type == 'openapi':
         data = analyze_openapi(args.input_file)
