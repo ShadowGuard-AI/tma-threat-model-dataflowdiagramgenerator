@@ -6,6 +6,9 @@ from jsonschema import validate, ValidationError
 import os
 import subprocess
 import sys  # Import the sys module
+import ast
+import re
+import tempfile
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -22,7 +25,6 @@ def setup_argparse():
     parser.add_argument("-v", "--validate", action="store_true", help="Validate input file against schema")
     parser.add_argument("-s", "--schema_file", help="Path to the schema file (YAML or JSON). Required if --validate is used")
     parser.add_argument("--plantuml_path", help="Path to the PlantUML executable.", default="plantuml")
-    parser.add_argument("--offensive_tools", help="Run offensive tools (e.g., Nmap) against the system.", action="store_true")
 
     return parser.parse_args()
 
@@ -92,155 +94,186 @@ def validate_data(data, schema_file):
         return False
 
 
+_SECRET_TOKEN = re.compile(r"[A-Za-z0-9_\-\.]*(?:SECRET|PASSWORD|PASSWD|TOKEN|SENTINEL|APIKEY|API_KEY)[A-Za-z0-9_\-\.]*", re.IGNORECASE)
+
+
+def _redact_secret_shaped(value):
+    return _SECRET_TOKEN.sub("[REDACTED]", value)
+
+
+def sanitize_text(value):
+    """Return value as inert single-line label text.
+
+    Control characters and newlines are replaced with spaces, secret shaped
+    tokens are redacted, and PlantUML directive characters at the start are
+    neutralized. Names and labels are published into the generated diagram,
+    so model authors must not put secrets in them; secret shaped values are
+    redacted before generation.
+    """
+    text = _redact_secret_shaped(str(value))
+    text = "".join(ch if (ord(ch) >= 32 and ord(ch) != 127) else " " for ch in text)
+    text = text.replace("[", "(").replace("]", ")").replace('"', "'")
+    text = text.replace("@", "").replace("!", "")
+    text = text.strip()
+    while text[:1] in ("@", "!", "#"):
+        text = text[1:].lstrip()
+    return text
+
+
+def make_alias(raw_name, used):
+    base = re.sub(r"[^A-Za-z0-9_]", "_", sanitize_text(raw_name))
+    base = re.sub(r"_+", "_", base).strip("_") or "Element"
+    if base[0].isdigit():
+        base = "E_" + base
+    alias = base
+    counter = 2
+    while alias in used:
+        alias = f"{base}_{counter}"
+        counter += 1
+    used.add(alias)
+    return alias
+
+
 def generate_plantuml_code(data):
-    """
-    Generates PlantUML code for a data flow diagram based on the input data.
-
-    Args:
-        data (dict): A dictionary containing the data flow information.
-                     The structure is assumed to be:
-                     {
-                         "processes": [{"name": "Process1", "description": "...", "type": "Process"}, ...],
-                         "data_stores": [{"name": "DataStore1", "description": "...", "type": "Data Store"}, ...],
-                         "external_entities": [{"name": "ExternalEntity1", "description": "...", "type": "External Entity"}, ...],
-                         "data_flows": [{"source": "Process1", "destination": "DataStore1", "label": "Data Flow 1"}, ...]
-                     }
-
-    Returns:
-        str: PlantUML code representing the data flow diagram.
-    """
     plantuml_code = "@startuml\n"
-    plantuml_code += "skinparam linetype ortho\n" # Improves diagram layout
-
-    # Define entities (Processes, Data Stores, External Entities)
+    plantuml_code += "skinparam linetype ortho\n"
+    used = set()
+    aliases = {}
     for entity_type in ["processes", "data_stores", "external_entities"]:
         if entity_type in data:
             for entity in data[entity_type]:
-                # Only spaces are folded, so two names that differ
-                # just in spaces versus underscores, My Process and
-                # My_Process, collapse to one alias and the second
-                # definition replaces the first in the diagram. A flow
-                # naming something never defined is not checked either:
-                # PlantUML draws it as a new box, so a typo in a source
-                # or destination becomes a phantom element.
-                entity_name = entity["name"].replace(" ", "_") # Replace spaces in names
+                raw_name = str(entity["name"])
+                alias = make_alias(raw_name, used)
+                aliases.setdefault(raw_name, alias)
+                display = sanitize_text(raw_name)
                 if entity_type == "processes":
-                    plantuml_code += f"component [{entity['name']}] as {entity_name}\n"
+                    plantuml_code += f"component [{display}] as {alias}\n"
                 elif entity_type == "data_stores":
-                    plantuml_code += f"database [{entity['name']}] as {entity_name}\n"
+                    plantuml_code += f"database [{display}] as {alias}\n"
                 elif entity_type == "external_entities":
-                    plantuml_code += f"actor [{entity['name']}] as {entity_name}\n"
-
-    # Define data flows
+                    plantuml_code += f"actor [{display}] as {alias}\n"
     if "data_flows" in data:
         for flow in data["data_flows"]:
-            source = flow["source"].replace(" ", "_")
-            destination = flow["destination"].replace(" ", "_")
-            label = flow.get("label", "")  # Use get to handle missing labels
-            plantuml_code += f"{source} --> {destination} : {label}\n"
-
+            source = aliases.get(str(flow["source"])) or make_alias(str(flow["source"]), used)
+            aliases.setdefault(str(flow["source"]), source)
+            destination = aliases.get(str(flow["destination"])) or make_alias(str(flow["destination"]), used)
+            aliases.setdefault(str(flow["destination"]), destination)
+            label = sanitize_text(flow.get("label", ""))
+            plantuml_code += f'{source} --> {destination} : "{label}"\n'
     plantuml_code += "@enduml"
     return plantuml_code
 
 
 def generate_diagram(plantuml_code, output_file, plantuml_path):
-    """
-    Generates a diagram from PlantUML code using the PlantUML tool.
+    """Render the diagram. Returns True on success, False on any failure.
 
-    Args:
-        plantuml_code (str): PlantUML code.
-        output_file (str): Path to the output diagram file.
-        plantuml_path (str): Path to the PlantUML executable.
+    The PlantUML source is staged in a temporary file inside the output
+    directory and removed afterwards. No fixed staging file is written to
+    the current working directory.
     """
+    output_dir = os.path.dirname(os.path.abspath(output_file))
+    staging_path = None
     try:
-        # Create a temporary file to store the PlantUML code
-        with open("temp.plantuml", "w") as f:
+        fd, staging_path = tempfile.mkstemp(prefix="dfd_", suffix=".plantuml", dir=output_dir)
+        with os.fdopen(fd, "w") as f:
             f.write(plantuml_code)
-
-        # The staging file name is fixed in the working directory, so
-        # parallel runs overwrite each other. A bare output file name
-        # also gives an empty directory here, and PlantUML is then
-        # called with an empty -o value.
-        # Construct the command to run PlantUML
-        command = [plantuml_path, "-tpng", "temp.plantuml", "-o", os.path.dirname(output_file)]
-
-        # Execute the command
+        command = [plantuml_path, "-tpng", staging_path, "-o", output_dir]
         process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         stdout, stderr = process.communicate()
-
         if process.returncode != 0:
             logging.error(f"PlantUML execution failed with error code {process.returncode}")
             logging.error(f"PlantUML stdout: {stdout.decode()}")
             logging.error(f"PlantUML stderr: {stderr.decode()}")
-        else:
-            logging.info(f"Diagram generated successfully: {output_file}")
-
-        # Clean up the temporary file
-        os.remove("temp.plantuml")
-        # Rename the generated file to the desired output filename. PlantUML can add the name itself if run with just the output directory instead of a full path
-        generated_filename = os.path.join(os.path.dirname(output_file), "temp.png")
+            return False
+        generated_filename = os.path.join(output_dir, os.path.splitext(os.path.basename(staging_path))[0] + ".png")
         if os.path.exists(generated_filename):
             os.rename(generated_filename, output_file)
-
+        if not os.path.exists(output_file):
+            logging.error("PlantUML ran but produced no diagram file.")
+            return False
+        logging.info(f"Diagram generated successfully: {output_file}")
+        return True
     except FileNotFoundError:
         logging.error(f"PlantUML executable not found at: {plantuml_path}")
+        return False
     except Exception as e:
         logging.error(f"An error occurred during diagram generation: {e}")
-
-
-def run_offensive_tools():
-    """
-    Placeholder function to demonstrate running offensive tools.
-    """
-    logging.info("Running offensive tools (placeholder). This should be implemented with actual tool execution.")
-    try:
-        # Example: Run nmap on localhost (replace with actual target)
-        result = subprocess.run(['nmap', '-p', '1-100', 'localhost'], capture_output=True, text=True, timeout=60)
-        logging.info(f"Nmap output:\n{result.stdout}")
-        if result.stderr:
-            logging.error(f"Nmap errors:\n{result.stderr}")
-    except subprocess.TimeoutExpired:
-        logging.error("Nmap scan timed out.")
-    except FileNotFoundError:
-        logging.error("Nmap not found. Please ensure it is installed and in your PATH.")
-    except Exception as e:
-        logging.error(f"Error running offensive tools: {e}")
+        return False
+    finally:
+        if staging_path and os.path.exists(staging_path):
+            os.remove(staging_path)
 
 
 def analyze_code(file_path):
-    """
-    Analyzes the source code to extract data flow information.
+    """Analyze a source file into data flow information.
 
-    Args:
-        file_path (str): Path to the source code file.
-
-    Returns:
-        dict: A dictionary containing the extracted data flow information.
-              Returns None if analysis fails.
+    Python files are parsed with the standard library AST: functions and
+    classes become processes, calls between them become data flows, and
+    imported modules become external entities. Other files get a line based
+    structural extraction of function-like definitions. Returns None when
+    the file does not exist or cannot be read.
     """
+    if not os.path.isfile(file_path):
+        logging.error(f"Code file not found: {file_path}")
+        return None
     try:
-        # This is a placeholder for actual code analysis logic.
-        # In a real implementation, you would use static analysis tools
-        # to identify data flows, processes, and data stores from the code.
-
-        logging.info(f"Analyzing code file: {file_path} (placeholder)")
-
-        # Example: Simulate code analysis by creating a dummy data flow
-        data = {
-            "processes": [{"name": "ProcessData", "description": "Processes input data"}],
-            "data_stores": [{"name": "Database", "description": "Stores processed data"}],
-            "external_entities": [{"name": "UserInput", "description": "User provides input"}],
-            "data_flows": [
-                {"source": "UserInput", "destination": "ProcessData", "label": "Input Data"},
-                {"source": "ProcessData", "destination": "Database", "label": "Stored Data"}
-            ]
-        }
-
-        return data
-
+        with open(file_path, "r", errors="replace") as f:
+            source = f.read()
     except Exception as e:
         logging.error(f"Error analyzing code: {e}")
         return None
+    processes = []
+    data_flows = []
+    external_entities = []
+    if file_path.endswith(".py"):
+        try:
+            tree = ast.parse(source)
+        except SyntaxError as e:
+            logging.error(f"Error parsing Python file {file_path}: {e}")
+            return None
+        defined = {}
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                defined[node.name] = node
+        for name in defined:
+            processes.append({"name": name, "description": f"Defined in {os.path.basename(file_path)}", "type": "Process"})
+        imported = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.extend(alias.name.split(".")[0] for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imported.append(node.module.split(".")[0])
+        for module_name in sorted(set(imported)):
+            external_entities.append({"name": module_name, "description": "Imported module", "type": "External Entity"})
+            if processes:
+                data_flows.append({"source": module_name, "destination": processes[0]["name"], "label": "imports"})
+        for name, node in defined.items():
+            for child in ast.walk(node):
+                if isinstance(child, ast.Call):
+                    callee = None
+                    if isinstance(child.func, ast.Name):
+                        callee = child.func.id
+                    elif isinstance(child.func, ast.Attribute):
+                        callee = child.func.attr
+                    if callee in defined and callee != name:
+                        flow = {"source": name, "destination": callee, "label": "calls"}
+                        if flow not in data_flows:
+                            data_flows.append(flow)
+    else:
+        pattern = re.compile(r"^\s*(?:def|class|function|func)\s+([A-Za-z_][A-Za-z0-9_]*)")
+        seen = []
+        for line in source.splitlines():
+            match = pattern.match(line)
+            if match and match.group(1) not in seen:
+                seen.append(match.group(1))
+                processes.append({"name": match.group(1), "description": f"Defined in {os.path.basename(file_path)}", "type": "Process"})
+        for first, second in zip(seen, seen[1:]):
+            data_flows.append({"source": first, "destination": second, "label": "calls"})
+    if not processes:
+        logging.error(f"No functions or classes found in code file: {file_path}")
+        return None
+    logging.info(f"Analyzed code file: {file_path} ({len(processes)} processes, {len(data_flows)} flows)")
+    return {"processes": processes, "data_stores": [], "external_entities": external_entities, "data_flows": data_flows}
 
 
 def analyze_openapi(file_path):
@@ -278,10 +311,12 @@ def analyze_openapi(file_path):
                     if "requestBody" in operation and "content" in operation["requestBody"]:
                         for content_type, content in operation["requestBody"]["content"].items():
                             if "schema" in content:
-                                data_store_name = f"Request Body ({content_type})"
+                                data_store_name = f"Request Body {process_name} ({content_type})"
                                 data_stores.append({"name": data_store_name, "description": f"Request body for {process_name}", "type": "Data Store"})
-                                data_flows.append({"source": "External User", "destination": process_name, "label": f"Request ({content_type})"})
-                                external_entities.append({"name": "External User", "description": "User interacting with the API", "type": "External Entity"})
+                                if not any(e["name"] == "External User" for e in external_entities):
+                                    external_entities.append({"name": "External User", "description": "User interacting with the API", "type": "External Entity"})
+                                data_flows.append({"source": "External User", "destination": data_store_name, "label": f"Request ({content_type})"})
+                                data_flows.append({"source": data_store_name, "destination": process_name, "label": f"Request ({content_type})"})
 
 
                     # Extract response body information as a data store
@@ -290,9 +325,12 @@ def analyze_openapi(file_path):
                             if "content" in response:
                                 for content_type, content in response["content"].items():
                                     if "schema" in content:
-                                        data_store_name = f"Response Body ({status_code}, {content_type})"
+                                        data_store_name = f"Response Body {process_name} ({status_code}, {content_type})"
                                         data_stores.append({"name": data_store_name, "description": f"Response body for {process_name}", "type": "Data Store"})
-                                        data_flows.append({"source": process_name, "destination": "External User", "label": f"Response ({status_code}, {content_type})"})
+                                        if not any(e["name"] == "External User" for e in external_entities):
+                                            external_entities.append({"name": "External User", "description": "User interacting with the API", "type": "External Entity"})
+                                        data_flows.append({"source": process_name, "destination": data_store_name, "label": f"Response ({status_code}, {content_type})"})
+                                        data_flows.append({"source": data_store_name, "destination": "External User", "label": f"Response ({status_code}, {content_type})"})
 
         # Consolidate the extracted information into the data flow diagram structure
         dfd_data = {
@@ -326,9 +364,6 @@ def main():
     if args.file_type == 'yaml' or args.file_type == 'json':
         data = load_data(args.input_file, args.file_type)
     elif args.file_type == 'code':
-        # Code mode never opens the file it is given. analyze_code
-        # returns the same sample diagram data for every input, so the
-        # diagram from this mode describes the sample, not the target.
         data = analyze_code(args.input_file)
     elif args.file_type == 'openapi':
         data = analyze_openapi(args.input_file)
@@ -350,11 +385,9 @@ def main():
     plantuml_code = generate_plantuml_code(data)
 
     # Generate diagram
-    generate_diagram(plantuml_code, args.output_file, args.plantuml_path)
-
-    # Run offensive tools if requested
-    if args.offensive_tools:
-        run_offensive_tools()
+    if not generate_diagram(plantuml_code, args.output_file, args.plantuml_path):
+        logging.error("Diagram generation failed. No diagram was produced.")
+        sys.exit(1)
 
     logging.info("Threat model automation completed.")
 
