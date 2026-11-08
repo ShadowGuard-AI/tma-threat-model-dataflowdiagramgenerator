@@ -135,17 +135,34 @@ def make_alias(raw_name, used):
 
 
 def generate_plantuml_code(data):
+    """Build PlantUML source from a model mapping.
+
+    Raises ValueError with a plain message for a model that is not a
+    mapping, a section that is not a list, an element without a name,
+    a flow without a source or destination, or a model with no
+    elements at all, instead of crashing or emitting an empty diagram
+    that looks like a successful result.
+    """
+    if not isinstance(data, dict):
+        raise ValueError(f"Model data must be a mapping with processes, data_stores, external_entities, and data_flows sections, not {type(data).__name__}.")
     plantuml_code = "@startuml\n"
     plantuml_code += "skinparam linetype ortho\n"
     used = set()
     aliases = {}
+    element_count = 0
     for entity_type in ["processes", "data_stores", "external_entities"]:
         if entity_type in data:
-            for entity in data[entity_type]:
+            entities = data[entity_type]
+            if not isinstance(entities, list):
+                raise ValueError(f"Model section '{entity_type}' must be a list.")
+            for entity in entities:
+                if not isinstance(entity, dict) or not str(entity.get("name") or "").strip():
+                    raise ValueError(f"Every entry in '{entity_type}' must be a mapping with a non-empty 'name'.")
                 raw_name = str(entity["name"])
                 alias = make_alias(raw_name, used)
                 aliases.setdefault(raw_name, alias)
                 display = sanitize_text(raw_name)
+                element_count += 1
                 if entity_type == "processes":
                     plantuml_code += f"component [{display}] as {alias}\n"
                 elif entity_type == "data_stores":
@@ -153,13 +170,20 @@ def generate_plantuml_code(data):
                 elif entity_type == "external_entities":
                     plantuml_code += f"actor [{display}] as {alias}\n"
     if "data_flows" in data:
-        for flow in data["data_flows"]:
+        flows = data["data_flows"]
+        if not isinstance(flows, list):
+            raise ValueError("Model section 'data_flows' must be a list.")
+        for flow in flows:
+            if not isinstance(flow, dict) or not str(flow.get("source") or "").strip() or not str(flow.get("destination") or "").strip():
+                raise ValueError("Every entry in 'data_flows' must be a mapping with a non-empty 'source' and 'destination'.")
             source = aliases.get(str(flow["source"])) or make_alias(str(flow["source"]), used)
             aliases.setdefault(str(flow["source"]), source)
             destination = aliases.get(str(flow["destination"])) or make_alias(str(flow["destination"]), used)
             aliases.setdefault(str(flow["destination"]), destination)
             label = sanitize_text(flow.get("label", ""))
             plantuml_code += f'{source} --> {destination} : "{label}"\n'
+    if element_count == 0:
+        raise ValueError("Model defines no processes, data stores, or external entities, so there is nothing to diagram.")
     plantuml_code += "@enduml"
     return plantuml_code
 
@@ -301,16 +325,25 @@ def analyze_openapi(file_path):
         data_flows = []
         external_entities = []
 
-        if "paths" in data:
+        http_methods = {"get", "put", "post", "delete", "options", "head", "patch", "trace"}
+        if "paths" in data and isinstance(data["paths"], dict):
             for path, path_item in data["paths"].items():
+                if not isinstance(path_item, dict):
+                    continue
                 for method, operation in path_item.items():
+                    # Path items also hold non-operation keys such as
+                    # path-level parameters (a list), summary, and
+                    # servers. Only HTTP methods with a mapping
+                    # operation describe an API operation.
+                    if str(method).lower() not in http_methods or not isinstance(operation, dict):
+                        continue
                     process_name = f"{method.upper()} {path}"
                     processes.append({"name": process_name, "description": operation.get("summary", "API Operation"), "type": "Process"})
 
                     # Extract request body information as a data store
-                    if "requestBody" in operation and "content" in operation["requestBody"]:
+                    if isinstance(operation.get("requestBody"), dict) and isinstance(operation["requestBody"].get("content"), dict):
                         for content_type, content in operation["requestBody"]["content"].items():
-                            if "schema" in content:
+                            if isinstance(content, dict) and "schema" in content:
                                 data_store_name = f"Request Body {process_name} ({content_type})"
                                 data_stores.append({"name": data_store_name, "description": f"Request body for {process_name}", "type": "Data Store"})
                                 if not any(e["name"] == "External User" for e in external_entities):
@@ -320,11 +353,11 @@ def analyze_openapi(file_path):
 
 
                     # Extract response body information as a data store
-                    if "responses" in operation:
+                    if isinstance(operation.get("responses"), dict):
                         for status_code, response in operation["responses"].items():
-                            if "content" in response:
+                            if isinstance(response, dict) and isinstance(response.get("content"), dict):
                                 for content_type, content in response["content"].items():
-                                    if "schema" in content:
+                                    if isinstance(content, dict) and "schema" in content:
                                         data_store_name = f"Response Body {process_name} ({status_code}, {content_type})"
                                         data_stores.append({"name": data_store_name, "description": f"Response body for {process_name}", "type": "Data Store"})
                                         if not any(e["name"] == "External User" for e in external_entities):
@@ -382,7 +415,11 @@ def main():
             sys.exit(1)
 
     # Generate PlantUML code
-    plantuml_code = generate_plantuml_code(data)
+    try:
+        plantuml_code = generate_plantuml_code(data)
+    except ValueError as e:
+        logging.error(f"Invalid model data: {e}")
+        sys.exit(1)
 
     # Generate diagram
     if not generate_diagram(plantuml_code, args.output_file, args.plantuml_path):
